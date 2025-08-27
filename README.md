@@ -98,3 +98,63 @@ This Android application demonstrates the use of shared OpenGL ES contexts for r
 *   Use the off-screen rendered texture directly in the on-screen rendering pipeline (e.g., render-to-texture).
 *   Explore error handling and resource management in more depth, especially for EGL state.
 *   Implement more robust thread synchronization mechanisms.
+
+## Switching Between `TextureView` and `GLSurfaceView` Implementations
+
+This project currently defaults to using `TextureView` for on-screen rendering, managed by `TextureViewRenderer.kt`. However, it was previously based on `GLSurfaceView` using `MyGLRenderer.kt`. If you wish to switch back to or experiment with the `GLSurfaceView` approach, here's a general guide:
+
+1.  **Modify `MainActivity.kt`**:
+    *   In the `MainScreen` composable, replace the `AndroidView` that creates a `TextureView` with one that creates a `GLSurfaceView`.
+        ```kotlin
+        // Example:
+        // var glSurfaceView: GLSurfaceView? = null // Make it a member if needed for requestRender
+        // val myRenderer = remember { MyGLRenderer(context) } // Assuming MyGLRenderer is adapted
+        
+        AndroidView(
+            factory = { ctx ->
+                GLSurfaceView(ctx).apply {
+                    setEGLContextClientVersion(2) // Or 3 if using GLES 3.x
+                    // setEGLConfigChooser(8, 8, 8, 8, 16, 0) // Optional: for depth/stencil
+                    setRenderer(myRenderer)
+                    renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY // Or RENDERMODE_CONTINUOUSLY
+                }.also { glSurfaceView = it }
+            },
+            modifier = Modifier.fillMaxWidth().weight(1f)
+        )
+        ```
+    *   Update the lifecycle management in `MainActivity` (`onResume`, `onPause`, `onDestroy`). Instead of calling methods on `textureViewRenderer`, you would typically call `glSurfaceView?.onResume()` and `glSurfaceView?.onPause()`. `MyGLRenderer` would manage its own resources within its lifecycle methods (`onSurfaceCreated`, `onSurfaceDestroyed`).
+    *   Change the "Change Color" button's `onClick` lambda to call `myRenderer.setTriangleColor(...)` and then `glSurfaceView?.requestRender()`.
+    *   The `offScreenBitmapFlow` would now be sourced from your `myRenderer` instance.
+
+2.  **Adapt `MyGLRenderer.kt`**:
+    *   `MyGLRenderer` would need to be the primary EGL context and GL thread manager for the on-screen view.
+    *   **Crucially**: `MyGLRenderer` needs to initialize its own EGL context for the `GLSurfaceView`. After this context is established (typically in `onSurfaceCreated`), it should then create and start the `OffScreenRenderThread`.
+    *   When creating `OffScreenRenderThread`, `MyGLRenderer` must pass its on-screen EGL context to the `OffScreenRenderThread` constructor as the `sharedEglContext`. The `OffScreenRenderThread.kt` is designed to accept this.
+        ```kotlin
+        // Inside MyGLRenderer, likely after on-screen EGL context is setup in onSurfaceCreated
+        // private var offScreenRenderThread: OffScreenRenderThread? = null
+        // private val onScreenTriangleColor = floatArrayOf(0.0f, 1.0f, 0.0f, 1.0f) // Initial color
+        
+        // ... in onSurfaceCreated ...
+        // val currentContext = EGL14.eglGetCurrentContext() // Get context GLSurfaceView made
+        // if (currentContext != EGL14.EGL_NO_CONTEXT) {
+        //     offScreenRenderThread = OffScreenRenderThread(
+        //         width = ..., // desired off-screen width
+        //         height = ..., // desired off-screen height
+        //         sharedEglContext = currentContext, // Pass the on-screen context
+        //         onBitmapReady = { bitmap ->
+        //             _offScreenBitmapFlow.value = bitmap
+        //         }
+        //     ).apply { start() }
+        //     offScreenRenderThread?.setTriangleColor(onScreenTriangleColor[0], onScreenTriangleColor[1], onScreenTriangleColor[2])
+        // } else {
+        //     Log.e(TAG, "Could not get current EGL context to share.")
+        // }
+        ```
+    *   `MyGLRenderer` will need to manage its own shader programs, vertex buffers, and MVP matrices for on-screen rendering, similar to how `TextureViewRenderer`'s internal `RenderThread` does.
+    *   It will also need methods like `setTriangleColor` (which should update its on-screen color and call the corresponding method on `offScreenRenderThread`) and potentially `cleanup` methods for its resources.
+
+3.  **`OffScreenRenderThread.kt`**:
+    *   This class is already set up to accept a shared EGL context in its constructor, so it should work with a correctly adapted `MyGLRenderer`.
+
+This switch involves a fair amount of careful EGL context management and ensuring the correct rendering calls are made in the appropriate places. The `GLSurfaceView` handles some EGL setup automatically, but sharing its context requires retrieving it after `onSurfaceCreated` has made it current.
