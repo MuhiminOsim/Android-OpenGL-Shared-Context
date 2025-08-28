@@ -2,6 +2,7 @@ package com.example.sharedcontextopengl
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.GLES20
@@ -11,6 +12,7 @@ import android.os.HandlerThread
 import android.util.Log
 import android.view.TextureView
 import kotlinx.coroutines.flow.MutableStateFlow
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -20,45 +22,63 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
 
     private val TAG = "TextureViewRenderer"
     private var renderThread: RenderThread? = null
-    var eglCore: EglCore? = null // Initialized by RenderThread
-    var windowSurface: WindowSurface? = null // Initialized by RenderThread
+    var eglCore: EglCore? = null
+    var windowSurface: WindowSurface? = null
 
-    // Shared EGL context, obtained from our RenderThread
     private var sharedEglContext: android.opengl.EGLContext = EGL14.EGL_NO_CONTEXT
 
-    // Off-screen rendering components
     val offScreenBitmapFlow = MutableStateFlow<Bitmap?>(null)
     private var offScreenRenderThread: OffScreenRenderThread? = null
-    private val offScreenWidth = 1024 // Or from config
-    private val offScreenHeight = 1024 // Or from config
+    private val offScreenWidth = 2048
+    private val offScreenHeight = 2048
 
-    // On-screen rendering properties
+    // Texture related properties
+    private var earthTextureId: Int = 0
+    private var flowerTextureId: Int = 0
+    @Volatile private var currentTextureId: Int = 0
+    private var textureToggle = false // false for earth, true for flower
+
+    // Shader and geometry for textured quad
     private var onScreenProgram: Int = 0
     private var onScreenPositionHandle: Int = 0
+    private var onScreenTexCoordHandle: Int = 0
     private var onScreenMVPMatrixHandle: Int = 0
-    private var onScreenColorHandle: Int = 0
-    private lateinit var onScreenTriangleVertices: FloatBuffer
+    private var onScreenTextureSamplerHandle: Int = 0
+    private lateinit var onScreenQuadVertices: FloatBuffer
+    private lateinit var onScreenTexCoords: FloatBuffer
     private val onScreenMvpMatrix = FloatArray(16)
-    @Volatile private var triangleColor = floatArrayOf(0.0f, 1.0f, 0.0f, 1.0f) // Unified color
 
-    private val onScreenVertexShaderCode =
+    private val texturedVertexShaderCode =
         "uniform mat4 uMVPMatrix;" +
         "attribute vec4 vPosition;" +
+        "attribute vec2 aTexCoord;" +
+        "varying vec2 vTexCoord;" +
         "void main() {" +
         "  gl_Position = uMVPMatrix * vPosition;" +
+        "  vTexCoord = aTexCoord;" +
         "}"
 
-    private val onScreenFragmentShaderCode =
+    private val texturedFragmentShaderCode =
         "precision mediump float;" +
-        "uniform vec4 uColor;" +
+        "varying vec2 vTexCoord;" +
+        "uniform sampler2D uTextureSampler;" +
         "void main() {" +
-        "  gl_FragColor = uColor;" +
+        "  gl_FragColor = texture2D(uTextureSampler, vTexCoord);" +
         "}"
 
-    private val onScreenTriangleCoords = floatArrayOf(
-        0.0f,  0.5f, 0.0f, // top
-       -0.5f, -0.5f, 0.0f, // bottom left
-        0.5f, -0.5f, 0.0f  // bottom right
+    // A full-screen quad
+    private val quadCoords = floatArrayOf(
+        -1.0f,  1.0f, 0.0f, // top left
+        -1.0f, -1.0f, 0.0f, // bottom left
+         1.0f,  1.0f, 0.0f, // top right
+         1.0f, -1.0f, 0.0f  // bottom right
+    )
+    // Texture coordinates (flip Y for Android Bitmaps)
+    private val texCoords = floatArrayOf(
+        0.0f, 0.0f, // top left
+        0.0f, 1.0f, // bottom left
+        1.0f, 0.0f, // top right
+        1.0f, 1.0f  // bottom right
     )
 
 
@@ -67,66 +87,62 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
         renderThread = RenderThread(surface, context).apply {
             this.renderer = this@TextureViewRenderer
             start()
-            // Wait for thread to initialize EGLCore and get shared context
-            // This is a simplified wait, a more robust solution might use a CountDownLatch
-            var attempts = 0
-            val maxAttempts = 200 // Wait up to 2 seconds (200 * 10ms)
-            while(this@TextureViewRenderer.sharedEglContext == EGL14.EGL_NO_CONTEXT && attempts < maxAttempts){
-                try {
-                    Thread.sleep(10) // Brief wait
-                    attempts++
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    Log.e(TAG, "Interrupted while waiting for shared context")
-                    // Clean up and exit if critical initialization fails
-                    stopAndReleaseRenderThread()
-                    return
-                }
-            }
-            if (this@TextureViewRenderer.sharedEglContext == EGL14.EGL_NO_CONTEXT) {
-                 Log.e(TAG, "Failed to get shared EGL context from RenderThread after $attempts attempts. Cannot initialize OffScreenRenderThread.")
-                 stopAndReleaseRenderThread() // Clean up on-screen thread as well
-                 return
-            } else {
-                 Log.d(TAG, "Successfully got shared EGL context from RenderThread. Initializing OffScreenRenderThread.")
-                 initOffScreenRenderThread() // Now initialize the off-screen thread
+        }
+        // OffScreenRenderThread initialization is now deferred to onRenderThreadFullyReady()
+        renderThread?.onSurfaceTextureAvailable(width, height)
+        requestRender()
+    }
+
+    // Called by RenderThread when EGL and GL scene (including textures) are ready
+    fun onRenderThreadFullyReady() {
+        Log.d(TAG, "RenderThread fully ready. Shared context: $sharedEglContext. Initializing OffScreenRenderThread.")
+        if (sharedEglContext != EGL14.EGL_NO_CONTEXT && earthTextureId != 0 && flowerTextureId != 0) {
+            initOffScreenRenderThread()
+        } else {
+            Log.e(TAG, "Cannot initialize OffScreenRenderThread: shared context or textures not ready. SharedCtx: $sharedEglContext, Earth: $earthTextureId, Flower: $flowerTextureId")
+            // Optionally, attempt to stop/cleanup renderThread if it failed to provide context
+            if (sharedEglContext == EGL14.EGL_NO_CONTEXT) {
+                stopAndReleaseRenderThread()
             }
         }
-        renderThread?.onSurfaceTextureAvailable(width, height)
-        requestRender() // Initial render for on-screen
     }
 
     private fun initOffScreenRenderThread() {
-        if (sharedEglContext == EGL14.EGL_NO_CONTEXT) {
-            Log.e(TAG, "Cannot init OffScreenRenderThread: sharedEglContext is EGL_NO_CONTEXT")
-            return
-        }
+        // Ensure this is called only when sharedEglContext and textures are valid
+        Log.d(TAG, "initOffScreenRenderThread called. Current texture ID for off-screen: $currentTextureId")
+        offScreenBitmapFlow.value = null // Reset bitmap flow
 
-        // Clean up any existing off-screen render thread first
         offScreenRenderThread?.stopRendering()
         try {
             offScreenRenderThread?.join(500)
-            Log.d(TAG, "Previous OffScreenRenderThread joined.")
         } catch (e: InterruptedException) {
-            Log.e(TAG, "Interrupted while joining previous off-screen thread", e)
             Thread.currentThread().interrupt()
+            Log.w(TAG, "Interrupted while joining previous OffScreenRenderThread")
         }
         offScreenRenderThread = null
-        offScreenBitmapFlow.value = null // Clear old bitmap
 
-        Log.d(TAG, "Creating new OffScreenRenderThread with shared context: $sharedEglContext")
         offScreenRenderThread = OffScreenRenderThread(
-            context,
-            sharedEglContext,
             offScreenWidth,
-            offScreenHeight
+            offScreenHeight,
+            sharedEglContext
         ) { newBitmap ->
             offScreenBitmapFlow.value = newBitmap
         }
-        offScreenRenderThread?.setTriangleColor(triangleColor[0], triangleColor[1], triangleColor[2])
+        // currentTextureId should be set by RenderThread.setupGLScene before this point
+        // and is the initial texture (e.g., earthTextureId)
+        offScreenRenderThread?.setCurrentTexture(currentTextureId)
         offScreenRenderThread?.start()
-        Log.d(TAG, "OffScreenRenderThread started.")
+        Log.d(TAG, "OffScreenRenderThread started with texture ID: $currentTextureId")
     }
+    
+    fun switchToNextImage() {
+        textureToggle = !textureToggle
+        currentTextureId = if (textureToggle) flowerTextureId else earthTextureId
+        Log.d(TAG, "Switching to texture ID: $currentTextureId (Earth: $earthTextureId, Flower: $flowerTextureId)")
+        requestRender() // Request on-screen render
+        offScreenRenderThread?.setCurrentTexture(currentTextureId) // Update off-screen texture
+    }
+
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
         Log.d(TAG, "onSurfaceTextureSizeChanged: $width x $height")
@@ -137,50 +153,37 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
         Log.d(TAG, "onSurfaceTextureDestroyed")
         stopAndReleaseRenderThread()
-        return true // SurfaceTexture is released by TextureView
+        return true
     }
     
     private fun stopAndReleaseRenderThread() {
         Log.d(TAG, "Stopping and releasing all render threads.")
-        // Stop off-screen thread first
         offScreenRenderThread?.stopRendering()
         try {
             offScreenRenderThread?.join(1000)
-            Log.d(TAG, "OffScreenRenderThread joined.")
         } catch (e: InterruptedException) {
-            Log.w(TAG, "OffScreenRenderThread join interrupted", e)
             Thread.currentThread().interrupt()
+            Log.w(TAG, "Interrupted while joining OffScreenRenderThread during shutdown")
         }
         offScreenRenderThread = null
         offScreenBitmapFlow.value?.recycle()
         offScreenBitmapFlow.value = null
 
-        // Stop on-screen render thread
         renderThread?.let {
             it.requestStop()
             try {
-                it.join(1000) // Wait for thread to finish
+                it.join(1000) 
             } catch (e: InterruptedException) {
-                Log.w(TAG, "OnScreen RenderThread join interrupted", e)
                 Thread.currentThread().interrupt()
+                Log.w(TAG, "Interrupted while joining RenderThread during shutdown")
             }
         }
         renderThread = null
-        sharedEglContext = EGL14.EGL_NO_CONTEXT // Reset shared context
+        sharedEglContext = EGL14.EGL_NO_CONTEXT // Reset shared context state
         Log.d(TAG, "All render threads stopped and resources released.")
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        // This is called when SurfaceTexture.updateTexImage() is called,
-        // which we don't do directly for active rendering.
-    }
-
-    fun setTriangleColor(r: Float, g: Float, b: Float) {
-        triangleColor = floatArrayOf(r, g, b, 1.0f)
-        requestRender() // Request on-screen render
-        offScreenRenderThread?.setTriangleColor(r, g, b) // Set for off-screen render
-        Log.d(TAG, "Set triangle color (R=$r, G=$g, B=$b) for both views")
-    }
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
 
     fun requestRender() {
         renderThread?.requestRender()
@@ -188,32 +191,26 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
 
     fun onResume() {
         Log.d(TAG, "onResume")
+        // If renderThread exists and is alive, it means surface was created.
+        // If it's not alive but exists, it might be in the process of stopping.
+        // If surface is available again, onSurfaceTextureAvailable will be called.
         renderThread?.let {
-            if (it.isAlive) {
-                 it.setSurfaceReady(true)
+            if (it.isAlive) { // Only interact if fully started and running
+                 it.setSurfaceReady(true) // Signal surface is ready for rendering operations
                  requestRender()
-                 // If off-screen thread was also paused, resume it
-                 // For now, OffScreenRenderThread manages its lifecycle based on requests
-                 // and the shared context validity derived from on-screen thread.
-                 // If surface was destroyed and recreated, onSurfaceTextureAvailable handles re-init.
             } else {
-                Log.w(TAG, "onResume: RenderThread is not alive. Waiting for onSurfaceTextureAvailable.")
+                Log.w(TAG, "onResume: RenderThread is not alive or not yet fully initialized.")
             }
         }
     }
 
     fun onPause() {
         Log.d(TAG, "onPause")
-        renderThread?.setSurfaceReady(false)
-        // OffScreenRenderThread doesn't have an explicit pause, relies on render requests.
-        // If GL context is lost (onSurfaceTextureDestroyed), it will be cleaned up.
+        renderThread?.setSurfaceReady(false) // Signal surface is not ready for rendering operations
     }
 
     fun onDestroy() {
         Log.d(TAG, "onDestroy called for TextureViewRenderer")
-        // This might be called by Activity's onDestroy.
-        // onSurfaceTextureDestroyed should handle cleanup if TextureView is part of the view hierarchy
-        // and is properly detached. If TextureViewRenderer is held longer, explicit cleanup here is vital.
         stopAndReleaseRenderThread()
     }
 
@@ -236,17 +233,50 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
         }
         return shader
     }
+    
+    private fun loadTexture(context: Context, assetPath: String): Int {
+        val textureIds = IntArray(1)
+        GLES20.glGenTextures(1, textureIds, 0)
+        if (textureIds[0] == 0) {
+            Log.e(TAG, "Could not generate a new OpenGL texture object.")
+            return 0
+        }
 
-    // Inner class for the rendering thread
-    private class RenderThread(
+        val bitmap: Bitmap? = try {
+            context.assets.open(assetPath).use { inputStream ->
+                BitmapFactory.decodeStream(inputStream)
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "Error loading texture $assetPath", e)
+            null
+        }
+
+        if (bitmap == null) {
+            Log.e(TAG, "Could not decode bitmap from asset: $assetPath")
+            GLES20.glDeleteTextures(1, textureIds, 0)
+            return 0
+        }
+
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureIds[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
+        bitmap.recycle()
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0) // Unbind
+        Log.d(TAG, "Loaded texture $assetPath with ID ${textureIds[0]}")
+        return textureIds[0]
+    }
+
+
+    private inner class RenderThread(
         private val surfaceTexture: SurfaceTexture,
-        private val context: Context
+        private val context: Context // Inner class also needs context if it were to load its own
     ) : HandlerThread("TextureViewRenderThread") {
 
         private val TAG_THREAD = "RenderThread(TV)"
-        @Volatile var renderer: TextureViewRenderer? = null // Reference to outer class
+        @Volatile var renderer: TextureViewRenderer? = null 
 
-       // private var handler: Handler? = null // If using Handler for messages
         private var eglCore: EglCore? = null
         private var windowSurface: WindowSurface? = null
 
@@ -254,36 +284,46 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
         private var screenHeight: Int = 0
 
         @Volatile private var isRunning = true
-        @Volatile private var renderRequested = true // Render once on start
-        @Volatile private var surfaceReady = false
-
-        init {
-            // HandlerThread.start() must be called by the creator of the thread.
-        }
+        @Volatile private var renderRequested = true 
+        @Volatile private var surfaceReady = false // Managed by onResume/onPause and after GL setup
 
         override fun run() {
             Log.d(TAG_THREAD, "RenderThread starting.")
+            val r = renderer ?: run {
+                Log.e(TAG_THREAD, "Renderer not set. Thread stopping.")
+                return
+            }
 
             if (!setupEGL()) {
                 Log.e(TAG_THREAD, "EGL setup failed. Thread stopping.")
                 cleanup()
-                // Notify outer class about failure to get shared context if applicable
-                renderer?.sharedEglContext = EGL14.EGL_NO_CONTEXT // Ensure it's reset
+                r.sharedEglContext = EGL14.EGL_NO_CONTEXT 
+                // Notify outer class of failure if necessary, though onRenderThreadFullyReady won't be called
                 return
             }
-            // Pass the EGL context to the outer TextureViewRenderer
-            renderer?.sharedEglContext = eglCore?.getEGLContext() ?: EGL14.EGL_NO_CONTEXT
-            renderer?.eglCore = this.eglCore // also pass eglCore itself if needed by outer
-            renderer?.windowSurface = this.windowSurface // and windowSurface
-            Log.d(TAG_THREAD, "EGL Context for sharing: ${renderer?.sharedEglContext}")
+            // Assign shared context to the outer class instance
+            r.sharedEglContext = this.eglCore?.getEGLContext() ?: EGL14.EGL_NO_CONTEXT
+            r.eglCore = this.eglCore 
+            r.windowSurface = this.windowSurface 
+            Log.d(TAG_THREAD, "EGL Context for sharing: ${r.sharedEglContext}")
 
-            if (!setupGLScene()) {
-                Log.e(TAG_THREAD, "GL scene setup failed. Thread stopping.")
+            if (r.sharedEglContext == EGL14.EGL_NO_CONTEXT) {
+                Log.e(TAG_THREAD, "Shared EGL context is EGL_NO_CONTEXT after EGL setup. Thread stopping.")
                 cleanup()
                 return
             }
 
-            surfaceReady = true // Mark as ready after setup
+            if (!setupGLScene()) {
+                Log.e(TAG_THREAD, "GL scene setup failed. Thread stopping.")
+                cleanup()
+                // Shared context might be valid, but textures failed to load.
+                // onRenderThreadFullyReady will still be called, but its check might fail.
+                r.onRenderThreadFullyReady() // Notify even on partial failure so initOffScreen can be skipped if needed
+                return
+            }
+            
+            surfaceReady = true // Surface is ready for drawing after EGL and GL setup
+            r.onRenderThreadFullyReady() // Notify that EGL, shared context, and textures are ready
 
             while (isRunning) {
                 synchronized(this) {
@@ -292,7 +332,8 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
                         renderRequested = false
                     } else {
                         try {
-                            (this as Object).wait(if (surfaceReady) 1000 else 100) // Adjust wait time
+                            // Wait longer if surface is ready but no render requested, shorter if surface not ready
+                            (this as Object).wait(if (surfaceReady && screenWidth > 0 && screenHeight > 0) 1000 else 100)
                         } catch (e: InterruptedException) {
                             Thread.currentThread().interrupt()
                             isRunning = false 
@@ -300,13 +341,14 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
                     }
                 }
             }
+            cleanupGLResources() // Cleanup GL resources before EGL
             cleanup()
             Log.d(TAG_THREAD, "RenderThread finished.")
         }
 
         private fun setupEGL(): Boolean {
             try {
-                eglCore = EglCore() // No shared context for the primary display EGL context
+                eglCore = EglCore() 
                 windowSurface = WindowSurface(eglCore!!, surfaceTexture)
                 windowSurface!!.makeCurrent()
             } catch (e: EglCore.EglException) {
@@ -318,11 +360,20 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
         }
 
         private fun setupGLScene(): Boolean {
-            val r = renderer ?: return false
+            val r = renderer ?: return false // Should have been checked earlier
             Log.d(TAG_THREAD, "Setting up GL scene for TextureView...")
 
-            val vertexShader = r.loadShader(GLES20.GL_VERTEX_SHADER, r.onScreenVertexShaderCode)
-            val fragmentShader = r.loadShader(GLES20.GL_FRAGMENT_SHADER, r.onScreenFragmentShaderCode)
+            r.earthTextureId = r.loadTexture(r.context, "earth.jpg")
+            r.flowerTextureId = r.loadTexture(r.context, "flower.jpg")
+            if (r.earthTextureId == 0 || r.flowerTextureId == 0) {
+                Log.e(TAG_THREAD, "Failed to load one or more textures.")
+                // Don't set currentTextureId if loading failed
+                return false
+            }
+            r.currentTextureId = r.earthTextureId // Default to earth
+
+            val vertexShader = r.loadShader(GLES20.GL_VERTEX_SHADER, r.texturedVertexShaderCode)
+            val fragmentShader = r.loadShader(GLES20.GL_FRAGMENT_SHADER, r.texturedFragmentShaderCode)
 
             if (vertexShader == 0 || fragmentShader == 0) {
                 r.onScreenProgram = 0
@@ -330,7 +381,10 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
             }
 
             r.onScreenProgram = GLES20.glCreateProgram()
-            if (r.onScreenProgram == 0) return false
+            if (r.onScreenProgram == 0) {
+                Log.e(TAG_THREAD, "Could not create on-screen program.")
+                return false
+            }
 
             GLES20.glAttachShader(r.onScreenProgram, vertexShader)
             GLES20.glAttachShader(r.onScreenProgram, fragmentShader)
@@ -344,45 +398,68 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
                 r.onScreenProgram = 0
                 return false
             }
-
             GLES20.glDeleteShader(vertexShader)
             GLES20.glDeleteShader(fragmentShader)
 
             r.onScreenPositionHandle = GLES20.glGetAttribLocation(r.onScreenProgram, "vPosition")
+            r.onScreenTexCoordHandle = GLES20.glGetAttribLocation(r.onScreenProgram, "aTexCoord")
             r.onScreenMVPMatrixHandle = GLES20.glGetUniformLocation(r.onScreenProgram, "uMVPMatrix")
-            r.onScreenColorHandle = GLES20.glGetUniformLocation(r.onScreenProgram, "uColor")
+            r.onScreenTextureSamplerHandle = GLES20.glGetUniformLocation(r.onScreenProgram, "uTextureSampler")
 
-            val bb = ByteBuffer.allocateDirect(r.onScreenTriangleCoords.size * 4)
+            var bb = ByteBuffer.allocateDirect(r.quadCoords.size * 4)
             bb.order(ByteOrder.nativeOrder())
-            r.onScreenTriangleVertices = bb.asFloatBuffer()
-            r.onScreenTriangleVertices.put(r.onScreenTriangleCoords)
-            r.onScreenTriangleVertices.position(0)
-            Log.d(TAG_THREAD, "GL scene setup complete for TextureView.")
+            r.onScreenQuadVertices = bb.asFloatBuffer()
+            r.onScreenQuadVertices.put(r.quadCoords)
+            r.onScreenQuadVertices.position(0)
+
+            bb = ByteBuffer.allocateDirect(r.texCoords.size * 4)
+            bb.order(ByteOrder.nativeOrder())
+            r.onScreenTexCoords = bb.asFloatBuffer()
+            r.onScreenTexCoords.put(r.texCoords)
+            r.onScreenTexCoords.position(0)
+            
+            Log.d(TAG_THREAD, "GL scene setup complete for TextureView. Earth: ${r.earthTextureId}, Flower: ${r.flowerTextureId}, Current: ${r.currentTextureId}")
             return true
         }
 
         private fun performRender() {
             val r = renderer ?: return
-            if (r.onScreenProgram == 0) return // Modified line
+            if (r.onScreenProgram == 0 || r.currentTextureId == 0) {
+                Log.w(TAG_THREAD, "Program (${r.onScreenProgram}) or currentTextureId (${r.currentTextureId}) is 0, skipping render.")
+                return
+            }
             
-            windowSurface?.makeCurrent() // Ensure context is current
+            windowSurface?.makeCurrent() 
 
             GLES20.glViewport(0, 0, screenWidth, screenHeight)
-            GLES20.glClearColor(1.0f, 0.0f, 0.0f, 1.0f) // Red background
+            // GLES20.glClearColor(1.0f, 0.0f, 0.0f, 1.0f) // Red background for on-screen TextureView
+            GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f) // Black background
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
 
             GLES20.glUseProgram(r.onScreenProgram)
+            
+            r.onScreenQuadVertices.position(0)
+            GLES20.glVertexAttribPointer(r.onScreenPositionHandle, 3, GLES20.GL_FLOAT, false, 0, r.onScreenQuadVertices)
             GLES20.glEnableVertexAttribArray(r.onScreenPositionHandle)
-            GLES20.glVertexAttribPointer(r.onScreenPositionHandle, 3, GLES20.GL_FLOAT, false, 0, r.onScreenTriangleVertices)
-            GLES20.glUniformMatrix4fv(r.onScreenMVPMatrixHandle, 1, false, r.onScreenMvpMatrix, 0)
-            GLES20.glUniform4fv(r.onScreenColorHandle, 1, r.triangleColor, 0) // Use unified color
 
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 3)
+            r.onScreenTexCoords.position(0)
+            GLES20.glVertexAttribPointer(r.onScreenTexCoordHandle, 2, GLES20.GL_FLOAT, false, 0, r.onScreenTexCoords)
+            GLES20.glEnableVertexAttribArray(r.onScreenTexCoordHandle)
+
+            GLES20.glUniformMatrix4fv(r.onScreenMVPMatrixHandle, 1, false, r.onScreenMvpMatrix, 0)
+            
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, r.currentTextureId)
+            GLES20.glUniform1i(r.onScreenTextureSamplerHandle, 0) // Tell sampler to use texture unit 0
+
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4) // Draw quad as triangle strip
 
             GLES20.glDisableVertexAttribArray(r.onScreenPositionHandle)
+            GLES20.glDisableVertexAttribArray(r.onScreenTexCoordHandle)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
             GLES20.glUseProgram(0)
 
-            windowSurface?.swapBuffers() // Present the frame
+            windowSurface?.swapBuffers() 
         }
 
         fun onSurfaceTextureAvailable(width: Int, height: Int) {
@@ -390,10 +467,8 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
                 Log.d(TAG_THREAD, "Surface available in thread: $width x $height")
                 this.screenWidth = width
                 this.screenHeight = height
-                surfaceReady = true // It becomes ready *after* EGL setup in run()
-                                  // This call might come before run() has fully initialized EGL.
-                                  // The check in run() loop for screenWidth/Height handles this.
                 updateMvpMatrix(width, height)
+                // surfaceReady is set after GL setup in run()
                 requestRender() 
             }
         }
@@ -410,30 +485,32 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
 
         private fun updateMvpMatrix(width: Int, height: Int) {
             val r = renderer ?: return
-            val aspectRatio: Float = if (height == 0) 1f else width.toFloat() / height.toFloat()
-            val projectionMatrix = FloatArray(16)
-            if (width > height) {
-                Matrix.orthoM(projectionMatrix, 0, -aspectRatio, aspectRatio, -1f, 1f, -1f, 1f)
-            } else {
-                Matrix.orthoM(projectionMatrix, 0, -1f, 1f, -1f/aspectRatio, 1f/aspectRatio, -1f, 1f)
-            }
-
-            val viewMatrix = FloatArray(16)
-            Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1.0f, 0.0f)
-            Matrix.multiplyMM(r.onScreenMvpMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
+            // Set to identity matrix since the quad coordinates are already in clip space
+            Matrix.setIdentityM(r.onScreenMvpMatrix, 0)
+            // If you want to preserve aspect ratio, calculations are needed here based on image and view dimensions.
+            // For example:
+            // if (width > 0 && height > 0) {
+            //    val aspectRatioView = width.toFloat() / height.toFloat()
+            //    // Assuming texture has its own aspectRatio (textureWidth / textureHeight)
+            //    // Matrix.orthoM(r.onScreenMvpMatrix, 0, -aspectRatioView, aspectRatioView, -1f, 1f, -1f, 1f)
+            //    // Or adjust based on texture aspect ratio to prevent stretching
+            // } else {
+            //    Matrix.setIdentityM(r.onScreenMvpMatrix, 0)
+            // }
         }
 
         fun requestRender() {
             synchronized(this) {
+                if (!isRunning) return // Don't request render if thread is stopping
                 renderRequested = true
                 (this as Object).notifyAll()
             }
         }
 
         fun requestStop() {
-            isRunning = false
             synchronized(this) {
-                (this as Object).notifyAll()
+                isRunning = false
+                (this as Object).notifyAll() // Wake up if waiting
             }
         }
 
@@ -441,31 +518,46 @@ class TextureViewRenderer(private val context: Context) : TextureView.SurfaceTex
             synchronized(this) {
                 surfaceReady = ready
                 if (ready) {
-                    (this as Object).notifyAll()
+                    Log.d(TAG_THREAD, "Surface marked as ready, requesting render.")
+                    requestRender() // Request a render when surface becomes ready again
                 } else {
                     Log.d(TAG_THREAD, "Surface marked as not ready.")
                 }
             }
         }
+        
+        private fun cleanupGLResources() {
+            val r = renderer ?: return
+            Log.d(TAG_THREAD, "Cleaning up GL resources in TextureView RenderThread.")
+            if (eglCore != null && eglCore!!.getEGLContext() != EGL14.EGL_NO_CONTEXT && windowSurface != null) {
+                 windowSurface!!.makeCurrent() // Need context to delete GL resources
+                 if (r.onScreenProgram != 0) {
+                    GLES20.glDeleteProgram(r.onScreenProgram)
+                    r.onScreenProgram = 0
+                }
+                val textureIds = intArrayOf(r.earthTextureId, r.flowerTextureId).filter { it != 0 }.toIntArray()
+                if (textureIds.isNotEmpty()) {
+                    GLES20.glDeleteTextures(textureIds.size, textureIds, 0)
+                }
+                r.earthTextureId = 0
+                r.flowerTextureId = 0
+                r.currentTextureId = 0
+                Log.d(TAG_THREAD, "On-screen program and textures deleted.")
+                eglCore!!.makeNothingCurrent()
+            } else {
+                Log.w(TAG_THREAD, "Skipping GL resource cleanup: EGL context or surface not available.")
+            }
+        }
 
         private fun cleanup() {
-            Log.d(TAG_THREAD, "Cleaning up TextureView RenderThread resources.")
-            // Detach context before releasing surface/core
-             eglCore?.makeNothingCurrent()
-
-            windowSurface?.release() // Releases EGLSurface
+            Log.d(TAG_THREAD, "Cleaning up TextureView RenderThread EGL resources.")
+            eglCore?.makeNothingCurrent() // Ensure nothing is current before releasing
+            windowSurface?.release() 
             windowSurface = null
-            eglCore?.release() // Releases EGLDisplay and EGLContext
+            eglCore?.release() 
             eglCore = null
-
-            val r = renderer
-            if (r != null && r.onScreenProgram != 0) {
-                // The EGL context is already released. Cannot make GL calls here.
-                // GLES20.glDeleteProgram(r.onScreenProgram)
-                r.onScreenProgram = 0
-                Log.d(TAG_THREAD, "On-screen program ID reset.")
-            }
-            renderer?.sharedEglContext = EGL14.EGL_NO_CONTEXT // Ensure reset
+            // renderer?.sharedEglContext = EGL14.EGL_NO_CONTEXT // This is handled by stopAndReleaseRenderThread
+            Log.d(TAG_THREAD, "TextureView EGL resources cleaned up.")
         }
     }
 }
@@ -597,9 +689,6 @@ class EglCore(sharedContextToCreateWith: android.opengl.EGLContext? = null, flag
         return EGL14.eglSwapBuffers(eglDisplay, eglSurface)
     }
 
-    // Other methods like setPresentationTime, isCurrent, querySurface, queryString, getGlVersion omitted for brevity
-    // but should be implemented similarly to previous EglCore if needed.
-
     private fun checkEglError(msg: String) {
         val error = EGL14.eglGetError()
         if (error != EGL14.EGL_SUCCESS) {
@@ -634,7 +723,7 @@ class EglCore(sharedContextToCreateWith: android.opengl.EGLContext? = null, flag
     fun releaseSurface(eglSurface: android.opengl.EGLSurface) {
         if (eglDisplay != EGL14.EGL_NO_DISPLAY && eglSurface != EGL14.EGL_NO_SURFACE) {
             EGL14.eglDestroySurface(this.eglDisplay, eglSurface)
-        } // No error check, destroying unknown surface is not an EGL error
+        } 
     }
 }
 
@@ -685,13 +774,12 @@ open class EglSurfaceBase(protected var eglCore: EglCore) {
      fun EglCore.querySurface(surface: android.opengl.EGLSurface, what: Int): Int {
         val value = IntArray(1)
         EGL14.eglQuerySurface(this.getEGLDisplay(), surface, what, value, 0)
-        // No error check on query usually
         return value[0]
     }
 }
 
 class WindowSurface(eglCore: EglCore, surface: SurfaceTexture, recordable: Boolean = false) : EglSurfaceBase(eglCore) {
-    private var surfaceTexture: SurfaceTexture? = surface // Keep a reference if needed for recreate
+    private var surfaceTexture: SurfaceTexture? = surface
     init {
         createWindowSurface(surface)
     }
@@ -700,7 +788,4 @@ class WindowSurface(eglCore: EglCore, surface: SurfaceTexture, recordable: Boole
         releaseEglSurface()
         surfaceTexture = null 
     }
-
-    // Recreate might be needed if SurfaceTexture is destroyed and a new one is provided.
-    // For now, assume TextureView manages SurfaceTexture lifetime relative to listener calls.
 }

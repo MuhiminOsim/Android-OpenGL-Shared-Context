@@ -58,7 +58,7 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     fun setTriangleColor(r: Float, g: Float, b: Float) {
         onScreenTriangleColor = floatArrayOf(r, g, b, 1.0f)
-        offScreenRenderThread?.setTriangleColor(r, g, b)
+//        offScreenRenderThread?.setTriangleColor(r, g, b)
         Log.d(TAG, "Set triangle color to: R=$r, G=$g, B=$b")
     }
 
@@ -140,15 +140,14 @@ class MyGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             // For now, we assume sharing is essential.
         } else {
              offScreenRenderThread = OffScreenRenderThread(
-                context,
-                sharedEglContext, // Pass the successfully obtained context
                 offScreenWidth,
-                offScreenHeight
+                offScreenHeight,
+                 sharedEglContext
             ) { newBitmap ->
                 offScreenBitmapFlow.value = newBitmap
             }
             // Set the initial color of the off-screen thread to match the on-screen color
-            offScreenRenderThread?.setTriangleColor(onScreenTriangleColor[0], onScreenTriangleColor[1], onScreenTriangleColor[2])
+//            offScreenRenderThread?.setTriangleColor(onScreenTriangleColor[0], onScreenTriangleColor[1], onScreenTriangleColor[2])
             offScreenRenderThread?.start()
         }
     }
