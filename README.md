@@ -1,16 +1,17 @@
 # Shared Context OpenGL Android App
 
-This Android application demonstrates the use of shared OpenGL ES contexts for rendering graphics both on-screen (using `TextureView`) and off-screen to a Bitmap. The rendered off-screen Bitmap is then displayed in a Jetpack Compose `Image` view. The application allows users to change the color of a triangle, and this color change is reflected in both the on-screen and off-screen renderings simultaneously.
+This Android application demonstrates the use of shared OpenGL ES contexts for rendering graphics both on-screen (using `TextureView`) and off-screen to a Bitmap. The rendered off-screen Bitmap is then displayed in a Jetpack Compose `Image` view. The application allows users to switch between different images, and this change is reflected in both the on-screen and off-screen renderings simultaneously.
 
 ## Features
 
-*   **On-Screen Rendering**: Utilizes `TextureView` with a custom rendering thread to render a triangle directly to the screen. This provides more control over the EGL context and rendering loop compared to `GLSurfaceView`.
-*   **Off-Screen Rendering**: Employs a separate thread (`OffScreenRenderThread`) to render the same triangle to an off-screen Framebuffer Object (FBO), which is then converted to a Bitmap.
-*   **Shared EGL Context**: Demonstrates how to create and share an EGL context between the `TextureViewRenderer`'s on-screen rendering thread and the custom `OffScreenRenderThread`. This allows both threads to share GPU resources.
+*   **On-Screen Rendering**: Utilizes `TextureView` with a custom rendering thread to render a textured quad (image) directly to the screen. This provides more control over the EGL context and rendering loop compared to `GLSurfaceView`.
+*   **Off-Screen Rendering**: Employs a separate thread (`OffScreenRenderThread`) to render the same textured quad to an off-screen Framebuffer Object (FBO), which is then converted to a Bitmap.
+*   **Shared EGL Context**: Demonstrates how to create and share an EGL context between the `TextureViewRenderer`'s on-screen rendering thread and the custom `OffScreenRenderThread`. This allows both threads to share GPU resources like textures.
 *   **Jetpack Compose UI**: The main UI is built with Jetpack Compose, showcasing how to integrate `TextureView` using `AndroidView` and display the off-screen rendered Bitmap in an `Image` composable.
-*   **Dynamic Color Change**: A button allows the user to cycle through different colors for the triangle, updating both renderings on demand.
+*   **Dynamic Image Change**: A button allows the user to cycle through different images, updating both renderings on demand.
 *   **Thread Synchronization**: `OffScreenRenderThread` uses `renderLock` and `wait`/`notifyAll` for managing its rendering loop, rendering only when requested. `TextureViewRenderer` manages its own render thread.
 *   **Bitmap Flow**: Uses `kotlinx.coroutines.flow.MutableStateFlow` to communicate the newly rendered off-screen Bitmap to the Compose UI for display.
+*   **Texture Loading**: Demonstrates loading images from drawable resources into OpenGL textures.
 
 ## Project Structure
 
@@ -18,60 +19,60 @@ This Android application demonstrates the use of shared OpenGL ES contexts for r
     *   Sets up the Jetpack Compose UI.
     *   Initializes `TextureViewRenderer`.
     *   Manages the `TextureView` lifecycle via `TextureViewRenderer` and Android Activity lifecycle callbacks.
-    *   Contains the `MainScreen` composable which includes the `TextureView` (via `AndroidView`) and the `Image` for off-screen rendering, along with a button to change colors.
+    *   Contains the `MainScreen` composable which includes the `TextureView` (via `AndroidView`) and the `Image` for off-screen rendering, along with a button to change images.
 *   **`TextureViewRenderer.kt`**: Manages rendering to a `TextureView`.
     *   Implements `TextureView.SurfaceTextureListener`.
     *   Manages a dedicated rendering thread (`RenderThread`) for on-screen OpenGL operations.
     *   Handles EGL context setup for the `TextureView`. The EGL context created here is shared with `OffScreenRenderThread`.
-    *   Manages the on-screen OpenGL shader program and vertex data for the triangle.
+    *   Loads textures from drawable resources.
+    *   Manages the on-screen OpenGL shader program and vertex data for the textured quad.
     *   Handles the creation and lifecycle of the `OffScreenRenderThread`.
-    *   Provides a `setTriangleColor` method to update the color in both renderers and `requestRender` to trigger on-screen redraws.
+    *   Provides a `switchToNextTexture()` method to change the displayed image in both renderers and `requestRender` to trigger on-screen redraws.
     *   Exposes `offScreenBitmapFlow` to provide the off-screen Bitmap to the UI.
     *   Includes methods for lifecycle management (e.g., `onActivityResume`, `onActivityPause`, `onActivityDestroy`) to correctly manage GL resources.
 *   **`OffScreenRenderThread.kt`**: A custom standalone thread for off-screen OpenGL rendering.
-    *   Its constructor now accepts a shared `android.opengl.EGLContext` from `TextureViewRenderer`.
+    *   Its constructor now accepts a shared `android.opengl.EGLContext` from `TextureViewRenderer` and the initial texture ID.
     *   Initializes its own EGL display and surface but uses the shared context.
     *   Sets up a Framebuffer Object (FBO) to render into.
-    *   Manages its own OpenGL shader program and vertex data for the triangle.
-    *   Renders the triangle to the FBO and then reads the pixels into a Bitmap.
+    *   Manages its own OpenGL shader program and vertex data for the textured quad.
+    *   Renders the textured quad to the FBO and then reads the pixels into a Bitmap.
     *   Uses a callback (`onBitmapReady`) to pass the generated Bitmap back to `TextureViewRenderer`.
     *   Manages its rendering loop (render-on-demand) and synchronization.
-*   **`MyGLRenderer.kt`**: (Replaced) Previously used with `GLSurfaceView`, this class is no longer central to the rendering process. Its functionalities for on-screen rendering and off-screen thread management have been migrated to `TextureViewRenderer.kt` and `OffScreenRenderThread.kt` respectively.
+    *   Includes a `setTextureId()` method to update the texture it renders.
+*   **`MyGLRenderer.kt`**: (No longer central) Previously used with `GLSurfaceView`, this class is not the primary component for the `TextureView` implementation.
 
 ## How it Works
 
 1.  **Initialization**:
     *   `MainActivity` creates an instance of `TextureViewRenderer`.
     *   The `MainScreen` composable embeds a `TextureView` using `AndroidView`. `textureViewRenderer` is set as its `surfaceTextureListener`.
-    *   Lifecycle methods in `MainActivity` (e.g., `onResume`, `onPause`, `onDestroy`) call corresponding methods in `textureViewRenderer` to manage resources.
+    *   Lifecycle methods in `MainActivity` call corresponding methods in `textureViewRenderer`.
 2.  **On-Screen Rendering (`TextureViewRenderer`)**:
     *   When the `TextureView`'s surface texture is available (`onSurfaceTextureAvailable`), `TextureViewRenderer` starts its internal `RenderThread`.
-    *   The `RenderThread` initializes an EGL display and creates an EGL window surface using the `SurfaceTexture`.
-    *   It creates a new EGL context. This context (`sharedEglContext`) is stored in `TextureViewRenderer` and will be passed to `OffScreenRenderThread`.
-    *   `setupGLScene()`: The `RenderThread` sets up the OpenGL shaders, program, and vertex buffers for drawing the on-screen triangle.
-    *   `onSurfaceTextureSizeChanged()`: Sets up the viewport and projection matrix for on-screen rendering.
-    *   The `RenderThread` enters a loop. It waits until `requestRender()` is called on `TextureViewRenderer` (e.g., when the color changes or for an initial frame).
-    *   When a render is requested, it makes its EGL context current, clears the surface, and draws the triangle using its shader program. The color is updated via a uniform. The frame is then presented using `eglSwapBuffers`.
-    *   When the surface is destroyed (`onSurfaceTextureDestroyed`), the `RenderThread` cleans up its EGL resources and terminates.
+    *   The `RenderThread` initializes an EGL display, an EGL window surface, and a new EGL context. This context (`sharedEglContext`) is stored and passed to `OffScreenRenderThread`.
+    *   `loadTextures()`: Loads images (e.g., from drawables) into OpenGL textures. Texture IDs are stored.
+    *   `setupGLScene()`: The `RenderThread` sets up OpenGL shaders (for texturing), program, and vertex/texture coordinate buffers for drawing the on-screen textured quad.
+    *   `updateMvpMatrix()`: Sets up the projection matrix (can be identity for simple 2D texture rendering).
+    *   The `RenderThread` enters a loop, waiting for `requestRender()`.
+    *   When a render is requested, it makes its EGL context current, clears the surface, binds the current texture, and draws the textured quad. The frame is presented via `eglSwapBuffers`.
+    *   When the surface is destroyed, the `RenderThread` cleans up its EGL resources and textures, then terminates.
 3.  **Off-Screen Rendering (`OffScreenRenderThread`)**:
-    *   Once `TextureViewRenderer`'s `RenderThread` has established its EGL context, `TextureViewRenderer` creates and starts an `OffScreenRenderThread`, passing the `sharedEglContext`.
-    *   **EGL Setup**: In `OffScreenRenderThread`'s `run()` method, it calls `initEGLAndFBO()`.
-        *   `initEGLAndFBO()`: Creates a new EGL display and initializes it. It then selects an EGL configuration and creates its EGL context using the `sharedEglContext` passed from `TextureViewRenderer`. A Pbuffer surface is created to make this context current for off-screen rendering.
-        *   An FBO is created, along with a texture to render into and a depth renderbuffer. These are attached to the FBO.
-    *   **Scene Setup**: `initGLScene()` sets up the OpenGL shaders and program for drawing the triangle.
+    *   Once `TextureViewRenderer`'s `RenderThread` has established its EGL context and loaded textures, `TextureViewRenderer` creates and starts an `OffScreenRenderThread`, passing the `sharedEglContext` and the initial `textureId`.
+    *   **EGL Setup**: `OffScreenRenderThread` uses the shared context to create its EGL resources and a Pbuffer surface for off-screen rendering.
+    *   An FBO is created and a texture is attached to it for rendering.
+    *   **Scene Setup**: Sets up OpenGL shaders and program for drawing the textured quad.
     *   **Rendering Loop**:
-        *   The thread waits until its `requestRender()` is called (e.g., when the color changes or for the initial frame).
-        *   When a render is requested, it binds the FBO, clears it, and draws the triangle. The color is updated via a uniform.
-        *   `createBitmapFromGLSurface()`: After drawing, `glReadPixels` is used to read the content of the FBO's color attachment into a `ByteBuffer`, which is then used to create a `Bitmap`.
-        *   The generated `Bitmap` is passed back to `TextureViewRenderer` via the `onBitmapReady` callback, which updates `offScreenBitmapFlow`.
+        *   The thread waits until its `requestRender()` is called.
+        *   When requested, it binds the FBO, clears it, binds the current texture (set via `setTextureId`), and draws the textured quad.
+        *   `createBitmapFromGLSurface()`: Reads the FBO content into a `Bitmap`.
+        *   The `Bitmap` is passed back to `TextureViewRenderer` via `onBitmapReady`, updating `offScreenBitmapFlow`.
 4.  **UI Update**:
-    *   The `MainScreen` composable collects updates from `textureViewRenderer.offScreenBitmapFlow`.
-    *   When a new Bitmap is emitted, the `Image` composable is recomposed to display the latest off-screen rendering.
-5.  **Color Change**:
-    *   Clicking the "Change Color" button in `MainActivity` calls `textureViewRenderer.setTriangleColor()`.
-    *   `TextureViewRenderer` updates its `triangleColor` and calls `setTriangleColor()` on the `offScreenRenderThread`.
-    *   `TextureViewRenderer` also calls its own `requestRender()` to trigger an on-screen redraw.
-    *   `OffScreenRenderThread.setTriangleColor()` updates its `offScreenTriangleColor` and calls its own `requestRender()` to trigger an off-screen redraw.
+    *   `MainScreen` collects updates from `textureViewRenderer.offScreenBitmapFlow` and displays the `Bitmap` in an `Image` composable.
+5.  **Image Change**:
+    *   Clicking the "Change Image" button calls `textureViewRenderer.switchToNextTexture()`.
+    *   `TextureViewRenderer` updates its current `textureId` and calls `setTextureId()` on the `offScreenRenderThread` with the new ID.
+    *   `TextureViewRenderer` calls its own `requestRender()` for on-screen redraw.
+    *   `OffScreenRenderThread.setTextureId()` updates its `currentTextureId` and calls its `requestRender()` for an off-screen redraw.
 
 ## Building and Running
 
@@ -81,80 +82,22 @@ This Android application demonstrates the use of shared OpenGL ES contexts for r
 
 ## Key OpenGL ES Concepts Demonstrated
 
-*   **Vertex and Fragment Shaders**: Basic shaders for transforming vertices and coloring fragments.
-*   **Shader Programs**: Linking vertex and fragment shaders into a program.
-*   **Vertex Attributes**: Passing vertex coordinate data to the vertex shader.
-*   **Uniforms**: Passing MVP matrix and color data to shaders.
-*   **MVP Matrix**: Model-View-Projection matrix for transforming 3D coordinates to 2D screen space.
-*   **EGL Contexts**: The environment for OpenGL ES rendering, including manual management for `TextureView`.
-*   **EGL Surfaces**: Drawing surfaces (the `SurfaceTexture` from `TextureView` and an off-screen Pbuffer).
-*   **Framebuffer Objects (FBOs)**: For off-screen rendering to a texture.
-*   `glReadPixels()`: Reading pixel data from the framebuffer.
+*   **Vertex and Fragment Shaders**: Shaders for transforming vertices and applying textures to fragments.
+*   **Shader Programs**: Linking shaders into a program.
+*   **Vertex Attributes**: Passing vertex coordinates and texture coordinates to the vertex shader.
+*   **Uniforms**: Passing MVP matrix and texture sampler to shaders.
+*   **Textures**: Loading image data into OpenGL textures (`glTexImage2D`, `glBindTexture`).
+*   **Samplers (`sampler2D`)**: Used in fragment shaders to read from textures.
+*   **EGL Contexts**: Managed for `TextureView` and shared.
+*   **EGL Surfaces**: `SurfaceTexture` for `TextureView` and an off-screen Pbuffer.
+*   **Framebuffer Objects (FBOs)**: For off-screen rendering.
+*   `glReadPixels()`: Reading pixel data.
 
 ## Potential Improvements/Further Exploration
 
-*   Share shader programs and VBOs between the contexts instead of recreating them.
-*   Implement more complex scenes.
-*   Use the off-screen rendered texture directly in the on-screen rendering pipeline (e.g., render-to-texture).
-*   Explore error handling and resource management in more depth, especially for EGL state.
-*   Implement more robust thread synchronization mechanisms.
+*   Share shader programs and VBOs/IBOs between contexts.
+*   Implement more complex scenes or image manipulations.
+*   Use the off-screen rendered texture directly in other GL operations without converting to Bitmap.
+*   More robust error handling and resource management.
 
-## Switching Between `TextureView` and `GLSurfaceView` Implementations
-
-This project currently defaults to using `TextureView` for on-screen rendering, managed by `TextureViewRenderer.kt`. However, it was previously based on `GLSurfaceView` using `MyGLRenderer.kt`. If you wish to switch back to or experiment with the `GLSurfaceView` approach, here's a general guide:
-
-1.  **Modify `MainActivity.kt`**:
-    *   In the `MainScreen` composable, replace the `AndroidView` that creates a `TextureView` with one that creates a `GLSurfaceView`.
-        ```kotlin
-        // Example:
-        // var glSurfaceView: GLSurfaceView? = null // Make it a member if needed for requestRender
-        // val myRenderer = remember { MyGLRenderer(context) } // Assuming MyGLRenderer is adapted
-        
-        AndroidView(
-            factory = { ctx ->
-                GLSurfaceView(ctx).apply {
-                    setEGLContextClientVersion(2) // Or 3 if using GLES 3.x
-                    // setEGLConfigChooser(8, 8, 8, 8, 16, 0) // Optional: for depth/stencil
-                    setRenderer(myRenderer)
-                    renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY // Or RENDERMODE_CONTINUOUSLY
-                }.also { glSurfaceView = it }
-            },
-            modifier = Modifier.fillMaxWidth().weight(1f)
-        )
-        ```
-    *   Update the lifecycle management in `MainActivity` (`onResume`, `onPause`, `onDestroy`). Instead of calling methods on `textureViewRenderer`, you would typically call `glSurfaceView?.onResume()` and `glSurfaceView?.onPause()`. `MyGLRenderer` would manage its own resources within its lifecycle methods (`onSurfaceCreated`, `onSurfaceDestroyed`).
-    *   Change the "Change Color" button's `onClick` lambda to call `myRenderer.setTriangleColor(...)` and then `glSurfaceView?.requestRender()`.
-    *   The `offScreenBitmapFlow` would now be sourced from your `myRenderer` instance.
-
-2.  **Adapt `MyGLRenderer.kt`**:
-    *   `MyGLRenderer` would need to be the primary EGL context and GL thread manager for the on-screen view.
-    *   **Crucially**: `MyGLRenderer` needs to initialize its own EGL context for the `GLSurfaceView`. After this context is established (typically in `onSurfaceCreated`), it should then create and start the `OffScreenRenderThread`.
-    *   When creating `OffScreenRenderThread`, `MyGLRenderer` must pass its on-screen EGL context to the `OffScreenRenderThread` constructor as the `sharedEglContext`. The `OffScreenRenderThread.kt` is designed to accept this.
-        ```kotlin
-        // Inside MyGLRenderer, likely after on-screen EGL context is setup in onSurfaceCreated
-        // private var offScreenRenderThread: OffScreenRenderThread? = null
-        // private val onScreenTriangleColor = floatArrayOf(0.0f, 1.0f, 0.0f, 1.0f) // Initial color
-        
-        // ... in onSurfaceCreated ...
-        // val currentContext = EGL14.eglGetCurrentContext() // Get context GLSurfaceView made
-        // if (currentContext != EGL14.EGL_NO_CONTEXT) {
-        //     offScreenRenderThread = OffScreenRenderThread(
-        //         width = ..., // desired off-screen width
-        //         height = ..., // desired off-screen height
-        //         sharedEglContext = currentContext, // Pass the on-screen context
-        //         onBitmapReady = { bitmap ->
-        //             _offScreenBitmapFlow.value = bitmap
-        //         }
-        //     ).apply { start() }
-        //     offScreenRenderThread?.setTriangleColor(onScreenTriangleColor[0], onScreenTriangleColor[1], onScreenTriangleColor[2])
-        // } else {
-        //     Log.e(TAG, "Could not get current EGL context to share.")
-        // }
-        ```
-    *   `MyGLRenderer` will need to manage its own shader programs, vertex buffers, and MVP matrices for on-screen rendering, similar to how `TextureViewRenderer`'s internal `RenderThread` does.
-    *   It will also need methods like `setTriangleColor` (which should update its on-screen color and call the corresponding method on `offScreenRenderThread`) and potentially `cleanup` methods for its resources.
-
-3.  **`OffScreenRenderThread.kt`**:
-    *   This class is already set up to accept a shared EGL context in its constructor, so it should work with a correctly adapted `MyGLRenderer`.
-
-This switch involves a fair amount of careful EGL context management and ensuring the correct rendering calls are made in the appropriate places. The `GLSurfaceView` handles some EGL setup automatically, but sharing its context requires retrieving it after `onSurfaceCreated` has made it current.
+(The section on switching between TextureView and GLSurfaceView has been omitted for brevity as the focus is now on the TextureView implementation rendering images, but the principles would be similar: adapting the relevant renderer to manage textures and share its context.)
